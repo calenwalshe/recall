@@ -1,5 +1,7 @@
 # /recall — Persistent Context for Claude Code
 
+![recall banner](banner.png)
+
 Never lose context after `/clear` again. `/recall` accumulates conversation context as you work and lets you bring it back with one command.
 
 ## What it does
