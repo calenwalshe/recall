@@ -16,6 +16,7 @@ cp context_store/storage.py ~/.claude/context-store/context_store/
 cp context_store/index.py ~/.claude/context-store/context_store/
 cp context_store/search.py ~/.claude/context-store/context_store/
 cp context_store/redact.py ~/.claude/context-store/context_store/
+cp context_store/signal.py ~/.claude/context-store/context_store/
 
 # 3. Copy hook
 echo "Copying capture hook..."
