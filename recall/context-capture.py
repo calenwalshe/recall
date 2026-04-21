@@ -21,6 +21,7 @@ from context_store.storage import (
     Chunk, write_chunk, generate_chunk_id, slug_from_cwd, get_config, write_default_config
 )
 from context_store.redact import is_suppressed_path, redact
+from context_store.signal import is_high_signal_bash, is_high_signal_file_change, is_high_signal_agent
 from context_store.index import (
     open_index, get_index_path, insert_chunk, evict_old_chunks
 )
@@ -61,13 +62,18 @@ def extract_chunk_from_tool_use(event: dict) -> Chunk | None:
         if is_suppressed_path(fp):
             return None
         if tool_name == "Write":
+            raw_content = tool_input.get("content", "")
+            if not is_high_signal_file_change(fp, raw_content):
+                return None
             summary = f"Wrote file: {fp}"
-            content = redact(tool_input.get("content", "")[:500])
+            content = redact(raw_content[:500])
         else:
-            old = redact(tool_input.get("old_string", "")[:200])
-            new = redact(tool_input.get("new_string", "")[:200])
+            old = tool_input.get("old_string", "")
+            new = tool_input.get("new_string", "")
+            if not is_high_signal_file_change(fp, new):
+                return None
             summary = f"Edited file: {fp}"
-            content = f"Changed:\n  - {old}\n  + {new}"
+            content = f"Changed:\n  - {redact(old[:200])}\n  + {redact(new[:200])}"
         chunk_type = "file_change"
         tags = ["file_change", Path(fp).suffix.lstrip(".") if fp else ""]
         tags = [t for t in tags if t]
@@ -79,6 +85,8 @@ def extract_chunk_from_tool_use(event: dict) -> Chunk | None:
             resp_text = str(tool_response.get("stdout", ""))[:300]
         elif isinstance(tool_response, str):
             resp_text = tool_response[:300]
+        if not is_high_signal_bash(cmd, resp_text):
+            return None
         summary = f"Ran command: {redact(cmd[:100])}"
         content = redact(f"$ {cmd}\n{resp_text}")
         chunk_type = "command_result"
@@ -86,9 +94,11 @@ def extract_chunk_from_tool_use(event: dict) -> Chunk | None:
 
     elif tool_name == "Agent":
         desc = tool_input.get("description", "")
-        prompt = redact(tool_input.get("prompt", "")[:300])
+        prompt = tool_input.get("prompt", "")
+        if not is_high_signal_agent(desc, prompt):
+            return None
         summary = f"Agent task: {desc}"
-        content = f"Agent: {desc}\nPrompt: {prompt}"
+        content = f"Agent: {desc}\nPrompt: {redact(prompt[:300])}"
         chunk_type = "finding"
         tags = ["agent", "subagent"]
 
