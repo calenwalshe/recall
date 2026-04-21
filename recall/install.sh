@@ -42,6 +42,8 @@ from pathlib import Path
 settings_path = Path.home() / ".claude" / "settings.json"
 hook_cmd = "$HOOK_CMD"
 hook_entry = {"type": "command", "command": hook_cmd, "async": True}
+# Stop/PostCompact require {"hooks": [...]} wrapper; PostToolUse requires {"matcher": ..., "hooks": [...]}
+wrapped_entry = {"hooks": [hook_entry]}
 
 if settings_path.exists():
     with open(settings_path) as f:
@@ -49,24 +51,23 @@ if settings_path.exists():
 else:
     settings = {}
 
+def has_capture(entries):
+    return any("context-capture" in str(e) for e in entries)
+
 # PostToolUse with matcher
 post_tool = settings.setdefault("hooks", {}).setdefault("PostToolUse", [])
-already = any(isinstance(h, dict) and "context-capture" in h.get("command", "") for h in post_tool)
-if not already:
-    post_tool.append({
-        "matcher": "Write|Edit|Bash|Agent",
-        "hooks": [hook_entry]
-    })
+if not has_capture(post_tool):
+    post_tool.append({"matcher": "Write|Edit|Bash|Agent", "hooks": [hook_entry]})
 
 # Stop
 stop_hooks = settings["hooks"].setdefault("Stop", [])
-if not any(isinstance(h, dict) and "context-capture" in h.get("command", "") for h in stop_hooks):
-    stop_hooks.append(hook_entry)
+if not has_capture(stop_hooks):
+    stop_hooks.append(wrapped_entry)
 
 # PostCompact
 compact_hooks = settings["hooks"].setdefault("PostCompact", [])
-if not any(isinstance(h, dict) and "context-capture" in h.get("command", "") for h in compact_hooks):
-    compact_hooks.append(hook_entry)
+if not has_capture(compact_hooks):
+    compact_hooks.append(wrapped_entry)
 
 settings_path.parent.mkdir(parents=True, exist_ok=True)
 with open(settings_path, "w") as f:
