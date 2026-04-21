@@ -84,12 +84,9 @@ db_path = get_index_path(slug)
 conn = open_index(db_path)
 query = "{QUERY}"  # the user's natural language query
 
-if is_model_available():
-    query_emb = embed_text(query)
-    candidates = search_vector(conn, query_emb, limit=50)
-else:
-    # Fallback to FTS5
-    candidates = search_fts5(conn, query, limit=50)
+from context_store.index import search_hybrid
+query_emb = embed_text(query) if is_model_available() else None
+candidates = search_hybrid(conn, query_emb, query, limit=10)
 
 conn.close()
 
