@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path.home() / ".claude" / "context-store"))
 from context_store.storage import (
     Chunk, write_chunk, generate_chunk_id, slug_from_cwd, get_config, write_default_config
 )
+from context_store.redact import is_suppressed_path, redact
 from context_store.index import (
     open_index, get_index_path, insert_chunk, evict_old_chunks
 )
@@ -57,12 +58,14 @@ def extract_chunk_from_tool_use(event: dict) -> Chunk | None:
 
     if tool_name in ("Write", "Edit"):
         fp = tool_input.get("file_path", "")
+        if is_suppressed_path(fp):
+            return None
         if tool_name == "Write":
             summary = f"Wrote file: {fp}"
-            content = tool_input.get("content", "")[:500]
+            content = redact(tool_input.get("content", "")[:500])
         else:
-            old = tool_input.get("old_string", "")[:200]
-            new = tool_input.get("new_string", "")[:200]
+            old = redact(tool_input.get("old_string", "")[:200])
+            new = redact(tool_input.get("new_string", "")[:200])
             summary = f"Edited file: {fp}"
             content = f"Changed:\n  - {old}\n  + {new}"
         chunk_type = "file_change"
@@ -71,20 +74,19 @@ def extract_chunk_from_tool_use(event: dict) -> Chunk | None:
 
     elif tool_name == "Bash":
         cmd = tool_input.get("command", "")
-        # Truncate long command output
         resp_text = ""
         if isinstance(tool_response, dict):
             resp_text = str(tool_response.get("stdout", ""))[:300]
         elif isinstance(tool_response, str):
             resp_text = tool_response[:300]
-        summary = f"Ran command: {cmd[:100]}"
-        content = f"$ {cmd}\n{resp_text}"
+        summary = f"Ran command: {redact(cmd[:100])}"
+        content = redact(f"$ {cmd}\n{resp_text}")
         chunk_type = "command_result"
         tags = ["command"]
 
     elif tool_name == "Agent":
         desc = tool_input.get("description", "")
-        prompt = tool_input.get("prompt", "")[:300]
+        prompt = redact(tool_input.get("prompt", "")[:300])
         summary = f"Agent task: {desc}"
         content = f"Agent: {desc}\nPrompt: {prompt}"
         chunk_type = "finding"
@@ -108,47 +110,38 @@ def extract_chunk_from_tool_use(event: dict) -> Chunk | None:
 
 
 def extract_session_summary(event: dict) -> Chunk | None:
-    """Extract a session summary chunk from a Stop event."""
+    """Build a session rollup from stored chunks rather than scraping the transcript.
+
+    Reads the last N chunks written during this session and synthesizes a summary
+    from their summaries — more reliable than parsing raw JSONL.
+    """
     session_id = event.get("session_id", "unknown")
     cwd = event.get("cwd", os.getcwd())
     project_slug = slug_from_cwd(cwd)
-    transcript_path = event.get("transcript_path", "")
 
-    # Try to read last portion of transcript for summary
-    summary_text = "Session ended"
-    if transcript_path and os.path.exists(transcript_path):
-        try:
-            with open(transcript_path, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                read_size = min(size, 8192)
-                f.seek(size - read_size)
-                tail = f.read().decode("utf-8", errors="replace")
-            # Parse last few JSONL entries for assistant messages
-            lines = tail.strip().split("\n")
-            assistant_msgs = []
-            for line in reversed(lines):
-                try:
-                    entry = json.loads(line)
-                    if entry.get("role") == "assistant":
-                        text = ""
-                        content = entry.get("content", [])
-                        if isinstance(content, str):
-                            text = content
-                        elif isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    text += block.get("text", "")
-                        if text:
-                            assistant_msgs.append(text[:500])
-                        if len(assistant_msgs) >= 3:
-                            break
-                except json.JSONDecodeError:
-                    continue
-            if assistant_msgs:
-                summary_text = "Session summary: " + " | ".join(reversed(assistant_msgs))
-        except Exception:
-            pass
+    rollup_lines = []
+    try:
+        from context_store.index import open_index, get_index_path
+        db_path = get_index_path(project_slug)
+        conn = open_index(db_path)
+        rows = conn.execute(
+            """SELECT chunk_type, summary FROM chunks
+               WHERE project_slug = ? AND session_id = ?
+               ORDER BY timestamp DESC LIMIT 20""",
+            (project_slug, session_id),
+        ).fetchall()
+        conn.close()
+        for row in reversed(rows):
+            rollup_lines.append(f"[{row[0]}] {row[1]}")
+    except Exception:
+        pass
+
+    if rollup_lines:
+        content = "Session activity:\n" + "\n".join(rollup_lines)
+        summary = f"Session rollup ({len(rollup_lines)} events)"
+    else:
+        content = "Session ended (no events captured)"
+        summary = "Session ended"
 
     ts = time.time()
     return Chunk(
@@ -157,9 +150,9 @@ def extract_session_summary(event: dict) -> Chunk | None:
         session_id=session_id,
         project_slug=project_slug,
         chunk_type="session_summary",
-        summary=summary_text[:200],
+        summary=summary,
         tags=["session_summary"],
-        content=summary_text[:2000],
+        content=content,
     )
 
 
@@ -191,8 +184,10 @@ def store_chunk(chunk: Chunk):
     # Ensure config exists
     write_default_config(chunk.project_slug)
 
-    # Write markdown file
+    # Write markdown file (returns None if suppressed by redaction)
     filepath = write_chunk(chunk)
+    if filepath is None:
+        return
 
     # Compute embedding
     embedding = embed_text(chunk.summary)

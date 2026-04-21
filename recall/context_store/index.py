@@ -206,6 +206,45 @@ def _bytes_to_floats(data: bytes) -> list[float]:
     return list(struct.unpack(f"{n}f", data))
 
 
+def search_hybrid(conn: sqlite3.Connection, query_embedding: Optional[bytes], query_text: str, limit: int = 10, k: int = 60) -> list[dict]:
+    """Hybrid search using Reciprocal Rank Fusion of vector + FTS5 results.
+
+    k is the RRF constant (60 is standard). Higher k reduces impact of rank position.
+    Falls back to FTS5-only if no embeddings available.
+    """
+    fts_results = search_fts5(conn, query_text, limit=limit * 5)
+    vec_results = search_vector(conn, query_embedding, limit=limit * 5) if query_embedding else []
+
+    # Build rank maps: chunk_id -> rank (1-based)
+    fts_rank = {r["id"]: i + 1 for i, r in enumerate(fts_results)}
+    vec_rank = {r["id"]: i + 1 for i, r in enumerate(vec_results)}
+
+    # Collect all candidate IDs
+    all_ids = set(fts_rank) | set(vec_rank)
+
+    # RRF score: sum of 1/(k + rank) for each list the chunk appears in
+    scores: dict[str, float] = {}
+    for chunk_id in all_ids:
+        score = 0.0
+        if chunk_id in fts_rank:
+            score += 1.0 / (k + fts_rank[chunk_id])
+        if chunk_id in vec_rank:
+            score += 1.0 / (k + vec_rank[chunk_id])
+        scores[chunk_id] = score
+
+    # Build lookup of all candidates
+    all_chunks = {r["id"]: r for r in fts_results}
+    all_chunks.update({r["id"]: r for r in vec_results})
+
+    ranked = sorted(all_ids, key=lambda cid: scores[cid], reverse=True)
+    results = []
+    for cid in ranked[:limit]:
+        row = dict(all_chunks[cid])
+        row["rrf_score"] = scores[cid]
+        results.append(row)
+    return results
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors."""
     if len(a) != len(b):

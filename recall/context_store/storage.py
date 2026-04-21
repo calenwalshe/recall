@@ -1,7 +1,9 @@
 """Chunk storage layer — markdown files with YAML frontmatter."""
 
+import hashlib
 import json
 import os
+import subprocess
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -92,11 +94,20 @@ def generate_chunk_id(timestamp: float) -> str:
     return f"chunk-{ts_str}"
 
 
-def write_chunk(chunk: Chunk) -> Path:
-    """Write a chunk to disk as a markdown file. Returns the file path."""
+def write_chunk(chunk: Chunk) -> Path | None:
+    """Write a chunk to disk after redaction. Returns path or None if suppressed."""
+    from .redact import redact_chunk_fields
+    summary, content, file_path = redact_chunk_fields(chunk.summary, chunk.content, chunk.file_path)
+    if not summary and not content:
+        return None
+    chunk = Chunk(
+        id=chunk.id, timestamp=chunk.timestamp, session_id=chunk.session_id,
+        project_slug=chunk.project_slug, chunk_type=chunk.chunk_type,
+        summary=summary, tags=chunk.tags, content=content,
+        tool_name=chunk.tool_name, file_path=file_path,
+    )
     chunks_dir = get_chunks_dir(chunk.project_slug)
-    filename = f"{chunk.id}.md"
-    filepath = chunks_dir / filename
+    filepath = chunks_dir / f"{chunk.id}.md"
     filepath.write_text(chunk.to_markdown(), encoding="utf-8")
     return filepath
 
@@ -115,8 +126,30 @@ def list_chunks(project_slug: str) -> list[Path]:
 
 
 def slug_from_cwd(cwd: str) -> str:
-    """Derive a project slug from a directory path."""
-    return Path(cwd).name.lower().replace(" ", "-")
+    """Derive a collision-resistant project slug from a directory path.
+
+    Uses git root if available (prevents two projects named 'src' from colliding).
+    Falls back to path hash when git is absent.
+    Format: {dirname}-{8-char-hash}
+    """
+    cwd_path = Path(cwd).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(cwd_path),
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            root = result.stdout.strip()
+            root_hash = hashlib.sha1(root.encode()).hexdigest()[:8]
+            name = Path(root).name.lower().replace(" ", "-")
+            return f"{name}-{root_hash}"
+    except Exception:
+        pass
+    # Fallback: use full path hash
+    path_hash = hashlib.sha1(str(cwd_path).encode()).hexdigest()[:8]
+    name = cwd_path.name.lower().replace(" ", "-")
+    return f"{name}-{path_hash}"
 
 
 def get_config(project_slug: str) -> dict:
